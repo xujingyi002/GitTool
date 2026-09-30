@@ -22,6 +22,9 @@ public class GitCommit
 
     /// <summary>列表展示文本：供界面直接绑定</summary>
     public string Display => $"{ShortHash}　{Date}　{Author}　{Subject}";
+
+    /// <summary>兜底：即使绑定丢掉 DisplayMember，下拉框也显示提交内容而不是类名</summary>
+    public override string ToString() => Display;
 }
 
 /// <summary>git 命令执行结果</summary>

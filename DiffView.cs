@@ -59,13 +59,28 @@ public class DiffView : UserControl
         };
 
         // 第一行：比对方式 + 基准/对比 + 开始比对
-        var row1 = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 36, WrapContents = false };
+        // 用 TableLayoutPanel 而不是固定宽度的 FlowLayoutPanel：
+        // 两个提交下拉按 50% 平分剩余宽度，窗口再窄也不会把「对比框 / 开始比对」挤出可视区被裁掉
+        var row1 = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 36,
+            ColumnCount = 7,
+            BackColor = Color.Transparent
+        };
+        row1.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));        // 比对方式：
+        row1.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));   // 比对方式下拉
+        row1.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));        // 基准：
+        row1.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));     // 基准下拉（随窗口伸缩）
+        row1.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));        // 对比：
+        row1.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));     // 对比下拉（随窗口伸缩）
+        row1.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));        // 开始比对
+        row1.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
-        row1.Controls.Add(LabelOf("比对方式："));
         _cmbMode = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
-            Width = 190,
+            Anchor = AnchorStyles.Left,
             Margin = new Padding(2, 5, 14, 0)
         };
         _cmbMode.Items.AddRange(new object[]
@@ -75,29 +90,32 @@ public class DiffView : UserControl
             "两次提交之间比对"
         });
         _cmbMode.SelectedIndexChanged += (_, _) => OnModeChanged();
-        row1.Controls.Add(_cmbMode);
+        row1.Controls.Add(_cmbMode, 1, 0);
+
+        row1.Controls.Add(LabelOf("比对方式："), 0, 0);
 
         _lblBase = LabelOf("基准：");
-        row1.Controls.Add(_lblBase);
-        _cmbBase = MakeCommitCombo(330);
-        row1.Controls.Add(_cmbBase);
+        row1.Controls.Add(_lblBase, 2, 0);
+        _cmbBase = MakeCommitCombo();
+        row1.Controls.Add(_cmbBase, 3, 0);
 
         _lblTo = LabelOf("对比：");
-        row1.Controls.Add(_lblTo);
-        _cmbTarget = MakeCommitCombo(330);
-        row1.Controls.Add(_cmbTarget);
+        row1.Controls.Add(_lblTo, 4, 0);
+        _cmbTarget = MakeCommitCombo();
+        row1.Controls.Add(_cmbTarget, 5, 0);
 
         _btnCompare = new Button
         {
             Text = "开始比对",
+            Anchor = AnchorStyles.Left,
             Size = new Size(96, 30),
-            Margin = new Padding(12, 5, 4, 0),
+            Margin = new Padding(12, 3, 4, 0),
             BackColor = Color.FromArgb(15, 76, 129),
             ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat
         };
         _btnCompare.Click += (_, _) => Compare();
-        row1.Controls.Add(_btnCompare);
+        row1.Controls.Add(_btnCompare, 6, 0);
 
         // 第二行：过滤开关 + 统计摘要
         var row2 = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 34, WrapContents = false };
@@ -241,12 +259,13 @@ public class DiffView : UserControl
         Margin = new Padding(0, 10, 0, 0)
     };
 
-    private static ComboBox MakeCommitCombo(int width) => new()
+    private static ComboBox MakeCommitCombo() => new()
     {
         DropDownStyle = ComboBoxStyle.DropDownList,
-        Width = width,
+        Anchor = AnchorStyles.Left | AnchorStyles.Right,   // 在表格列内横向撑满
         Margin = new Padding(2, 5, 10, 0),
-        DisplayMember = "Display"
+        // 下拉列表本体比框宽：框内放不下整行提交说明时，展开列表仍能看全后再选
+        DropDownWidth = 640
     };
 
     protected override void OnSizeChanged(EventArgs e)
@@ -333,6 +352,10 @@ public class DiffView : UserControl
         _cmbTarget.DataSource = null;
         _cmbBase.DataSource = new List<GitCommit>(_commits);
         _cmbTarget.DataSource = new List<GitCommit>(_commits);
+        // 注意：对 DataSource 赋值会把 DisplayMember 重置为空（WinForms 行为），
+        // 导致下拉框显示成类名 "GitTool.GitCommit"。必须在其后重新设置。
+        _cmbBase.DisplayMember = "Display";
+        _cmbTarget.DisplayMember = "Display";
 
         if (_commits.Count > 0)
         {
