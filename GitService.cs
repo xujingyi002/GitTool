@@ -192,4 +192,334 @@ public static class GitService
 
     /// <summary>当前 HEAD 的提交号（用于操作后刷新判断）</summary>
     public static string HeadHash(string repo) => Run(repo, "rev-parse", "--short", "HEAD").Output.Trim();
+
+    // ================= 变更比对（DiffView 的数据来源） =================
+
+    /// <summary>仓库是否已有提交（没有提交时 HEAD 无法解析，工作区比对要单独处理）</summary>
+    public static bool HasCommits(string repo) => Run(repo, "rev-parse", "--verify", "HEAD").Ok;
+
+    /// <summary>
+    /// 列出比对范围内的全部变更文件。
+    /// scope=WorkingTree 时取「工作区（含未跟踪新文件） vs HEAD」；
+    /// scope=CommitRange 时取 a..b；scope=SingleCommit 时取提交 a 自身引入的改动。
+    /// </summary>
+    public static List<FileChange> Changes(string repo, DiffScope scope, string a = "", string b = "")
+    {
+        if (!IsRepo(repo)) return new List<FileChange>();
+
+        switch (scope)
+        {
+            case DiffScope.WorkingTree:
+            {
+                // 尚无任何提交的新仓库：全部文件都算「未跟踪新增」
+                if (!HasCommits(repo)) return UntrackedFiles(repo);
+                var ns = Run(repo, "-c", "core.quotepath=false", "diff", "--name-status", "-z", "-M", "HEAD");
+                var num = Run(repo, "-c", "core.quotepath=false", "diff", "--numstat", "-z", "-M", "HEAD");
+                var list = ParseNameStatus(ns.Output, ParseNumStat(num.Output));
+                list.AddRange(UntrackedFiles(repo));
+                return list;
+            }
+            case DiffScope.CommitRange:
+            {
+                var ns = Run(repo, "-c", "core.quotepath=false", "diff", "--name-status", "-z", "-M", a, b);
+                var num = Run(repo, "-c", "core.quotepath=false", "diff", "--numstat", "-z", "-M", a, b);
+                return ParseNameStatus(ns.Output, ParseNumStat(num.Output));
+            }
+            default:
+            {
+                // git show 兼容「根提交」（git diff <hash>^ 在首次提交上会报错）
+                var ns = Run(repo, "-c", "core.quotepath=false", "show", "--format=", "--name-status", "-z", "-M", a);
+                var num = Run(repo, "-c", "core.quotepath=false", "show", "--format=", "--numstat", "-z", "-M", a);
+                return ParseNameStatus(ns.Output, ParseNumStat(num.Output));
+            }
+        }
+    }
+
+    /// <summary>未跟踪的新文件（git status 中的 "??"，-uall 展开到文件级）</summary>
+    public static List<FileChange> UntrackedFiles(string repo)
+    {
+        var list = new List<FileChange>();
+        var r = Run(repo, "-c", "core.quotepath=false", "status", "--porcelain", "-uall");
+        if (!r.Ok) return list;
+
+        foreach (var line in r.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!line.StartsWith("??", StringComparison.Ordinal)) continue;
+            var path = line.Length > 3 ? line[3..].Trim() : "";
+            if (string.IsNullOrWhiteSpace(path)) continue;
+
+            var (lines, binary) = InspectFile(repo, path);
+            list.Add(new FileChange
+            {
+                Kind = ChangeKind.Added,
+                FilePath = path,
+                Untracked = true,
+                Added = lines,
+                Binary = binary
+            });
+        }
+        return list;
+    }
+
+    /// <summary>单个文件的差异文本（右侧差异视图的数据源）</summary>
+    public static string PatchForFile(string repo, DiffScope scope, string a, string b, FileChange file, bool ignoreWhitespace)
+    {
+        if (!IsRepo(repo) || file is null) return "";
+        // 未跟踪文件 git 没有 diff，按「全部行都是新增」现场合成
+        if (file.Untracked) return SynthesizeUntrackedPatch(repo, file.FilePath);
+
+        var args = BuildDiffArgs(scope, a, b, ignoreWhitespace);
+        args.Add("--");
+        args.Add(file.FilePath);
+        // 重命名/复制必须把旧路径一起传给 git，否则路径过滤会让 git 退化成「新文件」
+        if (!string.IsNullOrWhiteSpace(file.OldPath) && file.OldPath != file.FilePath)
+        {
+            args.Add(file.OldPath);
+        }
+        return Run(repo, args.ToArray()).Text;
+    }
+
+    /// <summary>整个比对范围的差异文本（未选中具体文件时的「全部差异」）</summary>
+    public static string FullPatch(string repo, DiffScope scope, string a, string b, bool ignoreWhitespace)
+    {
+        if (!IsRepo(repo)) return "";
+
+        var text = Run(repo, BuildDiffArgs(scope, a, b, ignoreWhitespace).ToArray()).Text;
+        if (scope != DiffScope.WorkingTree) return text;
+
+        // 工作区模式补上未跟踪新文件（git diff 不包含它们）
+        var sb = new StringBuilder(text);
+        foreach (var f in UntrackedFiles(repo))
+        {
+            if (sb.Length > 0) sb.Append('\n');
+            sb.Append(SynthesizeUntrackedPatch(repo, f.FilePath));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>拼装 diff / show 命令的公共参数</summary>
+    private static List<string> BuildDiffArgs(DiffScope scope, string a, string b, bool ignoreWhitespace)
+    {
+        var args = new List<string> { "-c", "core.quotepath=false" };
+        switch (scope)
+        {
+            case DiffScope.WorkingTree:
+                args.Add("diff");
+                if (ignoreWhitespace) args.Add("-w");
+                if (HasCommits(a)) args.Add("HEAD");
+                break;
+            case DiffScope.CommitRange:
+                args.Add("diff");
+                args.Add("-M");
+                if (ignoreWhitespace) args.Add("-w");
+                args.Add(a);
+                args.Add(b);
+                break;
+            default:
+                args.Add("show");
+                args.Add("--format=");
+                args.Add("--patch");
+                if (ignoreWhitespace) args.Add("-w");
+                args.Add(a);
+                break;
+        }
+        return args;
+    }
+
+    /// <summary>把未跟踪文件合成为一段标准 diff 文本，让右侧视图能像普通改动一样逐行展示</summary>
+    private static string SynthesizeUntrackedPatch(string repo, string relPath)
+    {
+        var sb = new StringBuilder();
+        sb.Append("diff --git a/").Append(relPath).Append(" b/").Append(relPath).Append('\n');
+        sb.Append("new file mode 100644\n");
+        sb.Append("--- /dev/null\n");
+        sb.Append("+++ b/").Append(relPath).Append('\n');
+
+        var (_, binary) = InspectFile(repo, relPath);
+        if (binary)
+        {
+            sb.Append("（二进制 / 超大文件，不显示文本差异）\n");
+            return sb.ToString();
+        }
+
+        var text = DecodeText(File.ReadAllBytes(FullPathOf(repo, relPath)))
+            .Replace("\r\n", "\n").Replace('\r', '\n');
+        var lines = text.Split('\n');
+        var count = lines.Length;
+        if (count > 0 && lines[^1].Length == 0) count--;   // 结尾换行不算一行
+
+        sb.Append("@@ -0,0 +1,").Append(count).Append(" @@\n");
+        for (var i = 0; i < count; i++) sb.Append('+').Append(lines[i]).Append('\n');
+        return sb.ToString();
+    }
+
+    /// <summary>检查文件：文本文件返回行数；二进制或超大文件返回 Binary=true</summary>
+    private static (int Lines, bool Binary) InspectFile(string repo, string relPath)
+    {
+        try
+        {
+            var full = FullPathOf(repo, relPath);
+            var fi = new FileInfo(full);
+            if (!fi.Exists) return (0, true);
+            if (fi.Length > 2 * 1024 * 1024) return (0, true);
+
+            var bytes = File.ReadAllBytes(full);
+            var probe = Math.Min(bytes.Length, 8192);
+            for (var i = 0; i < probe; i++) if (bytes[i] == 0) return (0, true);
+
+            var text = DecodeText(bytes);
+            if (text.Length == 0) return (0, false);
+            var lines = text.Split('\n').Length;
+            if (text.EndsWith('\n')) lines--;
+            return (lines, false);
+        }
+        catch
+        {
+            return (0, true);
+        }
+    }
+
+    private static string FullPathOf(string repo, string relPath) =>
+        Path.Combine(repo, relPath.Replace('/', Path.DirectorySeparatorChar));
+
+    /// <summary>解码文本：UTF-8 为准，无法解码时用替换字符兜底（不抛异常）</summary>
+    private static string DecodeText(byte[] bytes) => new UTF8Encoding(false, false).GetString(bytes);
+
+    /// <summary>解析 --name-status -z 输出（\0 分隔；R/C 条目后带「旧路径 + 新路径」两个字段）</summary>
+    private static List<FileChange> ParseNameStatus(string output, Dictionary<string, (int Add, int Rem, bool Bin)> stats)
+    {
+        var tokens = output.Split('\0');
+        var list = new List<FileChange>();
+
+        for (var i = 0; i < tokens.Length; i++)
+        {
+            var code = tokens[i].Trim();
+            if (code.Length == 0) continue;
+
+            var kind = code[0] switch
+            {
+                'A' => ChangeKind.Added,
+                'M' => ChangeKind.Modified,
+                'D' => ChangeKind.Deleted,
+                'R' => ChangeKind.Renamed,
+                'C' => ChangeKind.Copied,
+                _ => ChangeKind.Other
+            };
+
+            var twoPaths = kind is ChangeKind.Renamed or ChangeKind.Copied;
+            if (i + (twoPaths ? 2 : 1) >= tokens.Length) break;
+
+            var oldPath = twoPaths ? tokens[i + 1] : "";
+            var path = twoPaths ? tokens[i + 2] : tokens[i + 1];
+            i += twoPaths ? 2 : 1;
+
+            var change = new FileChange { Kind = kind, FilePath = path, OldPath = oldPath };
+            if (stats.TryGetValue(path, out var s))
+            {
+                change.Added = s.Add;
+                change.Removed = s.Rem;
+                change.Binary = s.Bin;
+            }
+            list.Add(change);
+        }
+        return list;
+    }
+
+    /// <summary>解析 --numstat -z 输出（\0 分隔；重命名的路径跟在计数行之后的两个字段中）</summary>
+    private static Dictionary<string, (int Add, int Rem, bool Bin)> ParseNumStat(string output)
+    {
+        var tokens = output.Split('\0');
+        var map = new Dictionary<string, (int, int, bool)>(StringComparer.Ordinal);
+
+        for (var i = 0; i < tokens.Length; i++)
+        {
+            var token = tokens[i];
+            if (token.Length == 0) continue;
+
+            var parts = token.Split('\t');
+            if (parts.Length < 3) continue;   // 重命名的计数行形如 "1\t1\t"，路径在后续字段里
+
+            var bin = parts[0] == "-" || parts[1] == "-";
+            var add = !bin && int.TryParse(parts[0], out var x) ? x : 0;
+            var rem = !bin && int.TryParse(parts[1], out var y) ? y : 0;
+
+            var path = parts[2];
+            if (path.Length == 0)
+            {
+                if (i + 2 >= tokens.Length) break;
+                path = tokens[i + 2];   // 新路径
+                i += 2;
+            }
+            map[path] = (add, rem, bin);
+        }
+        return map;
+    }
+}
+
+/// <summary>比对口径</summary>
+public enum DiffScope
+{
+    /// <summary>工作区未提交改动 vs 最近一次提交</summary>
+    WorkingTree,
+
+    /// <summary>两次提交之间（a → b）</summary>
+    CommitRange,
+
+    /// <summary>某一个提交自身引入的改动</summary>
+    SingleCommit
+}
+
+/// <summary>单个变更文件的类型</summary>
+public enum ChangeKind
+{
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Other
+}
+
+/// <summary>比对范围内的一个变更文件（供界面列表直接绑定）</summary>
+public class FileChange
+{
+    public ChangeKind Kind { get; init; }
+
+    /// <summary>文件路径（重命名时为变更后的新路径）</summary>
+    public string FilePath { get; init; } = "";
+
+    /// <summary>重命名 / 复制前的旧路径</summary>
+    public string OldPath { get; init; } = "";
+
+    /// <summary>新增（+）行数；二进制文件为 0</summary>
+    public int Added { get; set; }
+
+    /// <summary>删除（−）行数</summary>
+    public int Removed { get; set; }
+
+    /// <summary>二进制或超大文件（不做文本差异）</summary>
+    public bool Binary { get; set; }
+
+    /// <summary>是否为「未跟踪的新文件」（git 尚未纳入版本控制）</summary>
+    public bool Untracked { get; init; }
+
+    /// <summary>状态中文描述（列表展示用）</summary>
+    public string KindText => Kind switch
+    {
+        ChangeKind.Added => Untracked ? "新增·未跟踪" : "新增",
+        ChangeKind.Modified => "修改",
+        ChangeKind.Deleted => "删除",
+        ChangeKind.Renamed => "重命名",
+        ChangeKind.Copied => "复制",
+        _ => "变更"
+    };
+
+    /// <summary>增删行数描述（列表展示用）</summary>
+    public string StatText => Binary ? "二进制" : Untracked ? $"+{Added}" : $"+{Added} −{Removed}";
+
+    /// <summary>是否为「新增类」条目（含未跟踪），供「仅显示新增」过滤使用</summary>
+    public bool IsAdded => Kind == ChangeKind.Added;
+
+    /// <summary>完整展示文本（可复制）</summary>
+    public string Display => $"[{KindText}] {FilePath}  {StatText}";
 }

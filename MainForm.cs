@@ -12,11 +12,13 @@ namespace GitTool;
 /// </summary>
 public class MainForm : Form
 {
-    private TextBox _txtRepo = null!;
+    private ComboBox _cmbRepo = null!;
     private Label _lblBranch = null!;
     private Label _lblStatus = null!;
+    private TabControl _tabs = null!;
     private DataGridView _grid = null!;
     private TextBox _txtDetail = null!;
+    private DiffView _diffView = null!;
     private TextBox _txtLog = null!;
     private Button _btnCommit = null!;
     private Button _btnDiscard = null!;
@@ -26,9 +28,15 @@ public class MainForm : Form
     private Button _btnNewBranch = null!;
     private Button _btnCheckout = null!;
     private Button _btnTag = null!;
+    private Button _btnDiff = null!;
 
     private List<GitCommit> _commits = new();
+
+    /// <summary>最近打开的仓库（最近使用的在最前），与下拉框内容一致</summary>
+    private List<string> _history = new();
     private string _repo = "";
+    private string _lastRemembered = "";   // 本次会话已记入历史的仓库（避免重复写盘）
+    private bool _loading;   // 重填下拉框期间抑制选中事件
 
     public MainForm()
     {
@@ -37,10 +45,21 @@ public class MainForm : Form
         ClientSize = new Size(1180, 760);
         Font = new Font("微软雅黑", 9F);
 
-        _repo = Directory.Exists(@"E:\agent\MES3") ? @"E:\agent\MES3" : Directory.GetCurrentDirectory();
+        _history = RepositoryStore.Load();
+        _repo = PickInitialRepo();
 
         BuildUi();
         Shown += (_, _) => RefreshAll();
+    }
+
+    /// <summary>启动时默认打开：上次用过的仓库 → 内置默认仓库 → 当前目录</summary>
+    private static string PickInitialRepo()
+    {
+        foreach (var p in RepositoryStore.Load())
+        {
+            if (Directory.Exists(p)) return p;
+        }
+        return Directory.Exists(@"E:\agent\MES3") ? @"E:\agent\MES3" : Directory.GetCurrentDirectory();
     }
 
     // ================= 界面构建 =================
@@ -52,16 +71,40 @@ public class MainForm : Form
 
         var row1 = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 34, WrapContents = false };
         row1.Controls.Add(Label("仓库路径："));
-        _txtRepo = new TextBox { Width = 620, Text = _repo, Font = new Font("Consolas", 9.5F), Margin = new Padding(2, 4, 6, 0) };
-        row1.Controls.Add(_txtRepo);
-        row1.Controls.Add(MakeButton("浏览…", BtnBrowse));
-        row1.Controls.Add(MakeButton("刷新", (_, _) => RefreshAll()));
+        _cmbRepo = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDown,          // 可直接输入/粘贴路径，也可从下拉历史中选择
+            AutoCompleteMode = AutoCompleteMode.SuggestAppend,
+            AutoCompleteSource = AutoCompleteSource.ListItems,
+            Width = 520,
+            Font = new Font("Consolas", 9.5F),
+            Margin = new Padding(2, 4, 6, 0)
+        };
+        _cmbRepo.SelectedIndexChanged += CmbRepo_SelectedIndexChanged;
+        _cmbRepo.KeyDown += CmbRepo_KeyDown;
+        row1.Controls.Add(_cmbRepo);
+
+        var btnBrowse = MakeButton("浏览…", BtnBrowse);
+        btnBrowse.Width = 78;
+        row1.Controls.Add(btnBrowse);
+
+        var btnRefresh = MakeButton("刷新", (_, _) => RefreshAll());
+        btnRefresh.Width = 64;
+        row1.Controls.Add(btnRefresh);
+
+        var btnForget = MakeButton("移除记录", BtnForgetRepo, Color.FromArgb(120, 130, 140));
+        btnForget.Width = 84;
+        row1.Controls.Add(btnForget);
+
         _lblBranch = new Label { Text = "分支：—", AutoSize = true, Margin = new Padding(14, 8, 0, 0), Font = new Font("微软雅黑", 9.5F, FontStyle.Bold), ForeColor = Color.FromArgb(15, 76, 129) };
         row1.Controls.Add(_lblBranch);
 
         _lblStatus = new Label { Dock = DockStyle.Bottom, Height = 26, Text = "—", TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.FromArgb(40, 50, 60) };
         top.Controls.Add(_lblStatus);
         top.Controls.Add(row1);
+
+        // 填入历史仓库列表：下次启动可直接从下拉框选择，无需再翻文件夹
+        RefreshRepoCombo(_repo);
 
         // ---- 底部：日志 ----
         _txtLog = new TextBox
@@ -93,6 +136,7 @@ public class MainForm : Form
         _btnNewBranch = MakeButton("新建分支", BtnNewBranch);
         _btnCheckout = MakeButton("切换分支/提交", BtnCheckout);
         _btnTag = MakeButton("打标签", BtnTag);
+        _btnDiff = MakeButton("查看提交的改动", BtnViewCommitDiff, Color.FromArgb(41, 128, 185));
         actions.Controls.Add(_btnCommit);
         actions.Controls.Add(_btnRevert);
         actions.Controls.Add(_btnResetSoft);
@@ -101,6 +145,7 @@ public class MainForm : Form
         actions.Controls.Add(_btnNewBranch);
         actions.Controls.Add(_btnCheckout);
         actions.Controls.Add(_btnTag);
+        actions.Controls.Add(_btnDiff);
         actions.Controls.Add(new Label
         {
             Text = "提示：高危操作（红按钮）执行前会自动 stash 备份当前改动，可在日志中看到恢复命令",
@@ -109,7 +154,7 @@ public class MainForm : Form
             Margin = new Padding(10, 12, 0, 0)
         });
 
-        // ---- 中部：提交历史 + 详情 ----
+        // ---- 中部：提交历史 + 详情（页签1） / 变更比对（页签2） ----
         var split = new SplitContainer
         {
             Dock = DockStyle.Fill,
@@ -117,7 +162,7 @@ public class MainForm : Form
             SplitterDistance = 560,
             BackColor = SystemColors.Control
         };
-        split.Panel1.Controls.Add(MakeGroup("提交历史（最新在上；选中一行 → 右侧查看详情与差异）", out _grid));
+        split.Panel1.Controls.Add(MakeGroup("提交历史（最新在上；双击某行 → 跳到「变更比对」查看改动）", out _grid));
         split.Panel2.Controls.Add(MakeGroup("提交详情 / 差异", out _txtDetail));
         _txtDetail.Multiline = true;
         _txtDetail.ReadOnly = true;
@@ -126,7 +171,27 @@ public class MainForm : Form
         _txtDetail.Font = new Font("Consolas", 9F);
         _txtDetail.BackColor = Color.FromArgb(250, 250, 250);
 
-        Controls.Add(split);
+        var tabHistory = new TabPage("提交历史 / 详情")
+        {
+            BackColor = Color.WhiteSmoke,
+            Padding = new Padding(3)
+        };
+        tabHistory.Controls.Add(split);
+
+        var tabDiff = new TabPage("变更比对（哪些文件被改了）")
+        {
+            BackColor = Color.WhiteSmoke,
+            Padding = new Padding(3)
+        };
+        _diffView = new DiffView { Dock = DockStyle.Fill };
+        _diffView.Log += AppendLog;
+        tabDiff.Controls.Add(_diffView);
+
+        _tabs = new TabControl { Dock = DockStyle.Fill };
+        _tabs.TabPages.Add(tabHistory);
+        _tabs.TabPages.Add(tabDiff);
+
+        Controls.Add(_tabs);
         Controls.Add(actions);
         Controls.Add(_txtLog);
         Controls.Add(top);
@@ -203,6 +268,8 @@ public class MainForm : Form
         _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Subject", HeaderText = "说明", DataPropertyName = "Subject", FillWeight = 60 });
         _grid.SelectionChanged -= Grid_SelectionChanged;
         _grid.SelectionChanged += Grid_SelectionChanged;
+        _grid.CellDoubleClick -= Grid_CellDoubleClick;
+        _grid.CellDoubleClick += Grid_CellDoubleClick;
     }
 
     // ================= 数据加载 =================
@@ -210,17 +277,23 @@ public class MainForm : Form
     /// <summary>刷新仓库状态、分支与提交历史（每次操作后都会调用）</summary>
     private void RefreshAll()
     {
-        _repo = _txtRepo.Text.Trim();
+        _repo = _cmbRepo.Text.Trim().Trim('"').Trim();
         if (!Directory.Exists(_repo) || !GitService.IsRepo(_repo))
         {
             _lblBranch.Text = "分支：—";
-            _lblStatus.Text = "✖ 该目录不是 git 仓库（请检查路径）";
+            _lblStatus.Text = "✖ 该目录不是 git 仓库（检查路径，或直接在下拉框中选择历史仓库）";
             _lblStatus.ForeColor = Color.FromArgb(192, 0, 0);
+            Text = "Git 仓库管理工具";
             _grid.DataSource = null;
             _txtDetail.Clear();
+            _diffView.SetRepo(_repo);
             return;
         }
 
+        RememberRepo(_repo);   // 识别成功 → 记入下拉历史，下次直接选
+
+        var name = Path.GetFileName(_repo.TrimEnd(Path.DirectorySeparatorChar));
+        Text = string.IsNullOrEmpty(name) ? $"{_repo} — Git 仓库管理工具" : $"[{name}] Git 仓库管理工具";
         _lblBranch.Text = $"分支：{GitService.CurrentBranch(_repo)}";
         _lblStatus.Text = $"仓库状态：{GitService.StatusSummary(_repo)}　｜　HEAD：{GitService.HeadHash(_repo)}";
         _lblStatus.ForeColor = GitService.Status(_repo).Length == 0 ? Color.FromArgb(39, 174, 96) : Color.FromArgb(230, 126, 34);
@@ -234,12 +307,113 @@ public class MainForm : Form
             _grid.Rows[0].Selected = true;
         }
         LoadDetail();
+        _diffView.SetRepo(_repo);
+    }
+
+    /// <summary>识别成功后把仓库记入历史（下次可从下拉框直接选）</summary>
+    private void RememberRepo(string repo)
+    {
+        // 本次会话已经记过这个仓库 → 不再重写文件（也避免「移除记录」后立刻被加回来）
+        if (string.Equals(_lastRemembered, repo, StringComparison.OrdinalIgnoreCase))
+        {
+            _cmbRepo.Text = repo;
+            return;
+        }
+        _lastRemembered = repo;
+
+        if (_history.Count > 0 && string.Equals(_history[0], repo, StringComparison.OrdinalIgnoreCase))
+        {
+            _cmbRepo.Text = repo;
+            return;
+        }
+
+        _history = RepositoryStore.Add(repo);
+        RefreshRepoCombo(repo);
+        AppendLog($"✔ 已记住仓库（下次可直接下拉选择）：{repo}");
+    }
+
+    /// <summary>重填下拉框内容并保持文本框显示路径</summary>
+    private void RefreshRepoCombo(string? keepText)
+    {
+        _loading = true;
+        try
+        {
+            _cmbRepo.BeginUpdate();
+            _cmbRepo.Items.Clear();
+            _cmbRepo.Items.AddRange(_history.ToArray());
+            _cmbRepo.EndUpdate();
+
+            var text = keepText ?? _cmbRepo.Text;
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                _cmbRepo.Text = text;
+                _cmbRepo.SelectionStart = _cmbRepo.Text.Length;
+                _cmbRepo.SelectionLength = 0;
+            }
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    /// <summary>从下拉框里选了一个历史仓库 → 立即切换</summary>
+    private void CmbRepo_SelectedIndexChanged(object? sender, EventArgs e)
+    {
+        if (_loading) return;
+        if (_cmbRepo.SelectedItem is not string path || path.Length == 0) return;
+        if (string.Equals(path, _repo, StringComparison.OrdinalIgnoreCase)) return;
+        RefreshAll();
+    }
+
+    /// <summary>在路径框里按回车 → 立即加载该仓库</summary>
+    private void CmbRepo_KeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.KeyCode != Keys.Enter) return;
+        e.SuppressKeyPress = true;
+        e.Handled = true;
+        RefreshAll();
+    }
+
+    /// <summary>把当前路径从历史记录中移除（不影响已打开的仓库）</summary>
+    private void BtnForgetRepo(object? sender, EventArgs e)
+    {
+        var path = _cmbRepo.Text.Trim();
+        if (path.Length == 0) return;
+        if (!_history.Any(x => string.Equals(x, path, StringComparison.OrdinalIgnoreCase)))
+        {
+            Warn("当前路径不在历史记录里，无需移除。");
+            return;
+        }
+
+        _history = RepositoryStore.Remove(path);
+        RefreshRepoCombo(path);
+        AppendLog($"已从下拉列表移除：{path}（记录文件：{RepositoryStore.StorageFile}）");
     }
 
     private GitCommit? Selected() =>
         _grid.SelectedRows.Count == 0 ? null : _grid.SelectedRows[0].DataBoundItem as GitCommit;
 
     private void Grid_SelectionChanged(object? sender, EventArgs e) => LoadDetail();
+
+    /// <summary>双击提交行 → 直接跳到「变更比对」页看这次提交改了什么</summary>
+    private void Grid_CellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0) return;
+        var c = Selected();
+        if (c is null) return;
+        _tabs.SelectedIndex = 1;
+        _diffView.JumpToCommit(c.Hash);
+    }
+
+    /// <summary>「查看提交的改动」按钮：内容与双击提交行一致</summary>
+    private void BtnViewCommitDiff(object? sender, EventArgs e)
+    {
+        var c = Selected();
+        if (!EnsureRepo() || c is null) { Warn("请先在左侧提交历史中选择一个提交。"); return; }
+        _tabs.SelectedIndex = 1;
+        _diffView.JumpToCommit(c.Hash);
+    }
 
     /// <summary>加载选中提交的详情（含变更文件统计）</summary>
     private void LoadDetail()
@@ -265,7 +439,7 @@ public class MainForm : Form
     {
         using var dlg = new FolderBrowserDialog { Description = "选择 git 仓库目录", SelectedPath = _repo };
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        _txtRepo.Text = dlg.SelectedPath;
+        _cmbRepo.Text = dlg.SelectedPath;
         RefreshAll();
     }
 
