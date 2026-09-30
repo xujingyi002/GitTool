@@ -1,0 +1,10 @@
+# 构建产物
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.log
+
+# 临时验证工程
+.verify/
