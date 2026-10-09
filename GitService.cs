@@ -196,6 +196,101 @@ public static class GitService
     /// <summary>当前 HEAD 的提交号（用于操作后刷新判断）</summary>
     public static string HeadHash(string repo) => Run(repo, "rev-parse", "--short", "HEAD").Output.Trim();
 
+    // ================= 远程同步（提交自动推送 / 拉取分支） =================
+
+    /// <summary>远程名列表（如 ["origin"]）；无远程或出错返回空列表（不抛异常）</summary>
+    public static List<string> Remotes(string repo)
+    {
+        var r = Run(repo, "remote");
+        if (!r.Ok) return new List<string>();
+        return r.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
+    }
+
+    /// <summary>是否存在指定名称的远程（默认 origin）</summary>
+    public static bool HasRemote(string repo, string name = "origin") =>
+        Remotes(repo).Any(x => string.Equals(x, name, StringComparison.Ordinal));
+
+    /// <summary>当前分支的 upstream（如 "origin/main"）；无 upstream 或出错返回空字符串</summary>
+    public static string Upstream(string repo, string branch)
+    {
+        var r = Run(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", $"{branch}@{{upstream}}");
+        return r.Ok ? r.Output.Trim() : "";
+    }
+
+    /// <summary>
+    /// 推送到远程（默认把当前分支推到 origin）。
+    /// setUpstream=true 时加 --set-upstream（首次推送用，让本地分支跟踪远程）。
+    /// 分离 HEAD / 无法识别分支 / 无 origin 时不抛异常，返回带错误信息的 GitResult。
+    /// </summary>
+    public static GitResult Push(string repo, bool setUpstream = false)
+    {
+        var branch = CurrentBranch(repo);
+        if (branch is "HEAD" or "" or "（未知）")
+            return new GitResult { ExitCode = -1, Error = "当前处于分离 HEAD 或无法识别分支，无法推送。请先切换到具体分支。" };
+
+        var args = new List<string> { "push" };
+        if (setUpstream) args.Add("--set-upstream");
+        args.Add("origin");
+        args.Add(branch);
+        return Run(repo, args.ToArray());
+    }
+
+    /// <summary>从远程获取更新（默认 origin；含所有分支与标签）</summary>
+    public static GitResult Fetch(string repo, string remote = "origin") => Run(repo, "fetch", remote);
+
+    /// <summary>
+    /// 拉取当前分支的远程更新：已有 upstream 走 git pull，否则 git pull origin &lt;branch&gt;。
+    /// 分离 HEAD / 无法识别分支时不抛异常。
+    /// </summary>
+    public static GitResult Pull(string repo)
+    {
+        var branch = CurrentBranch(repo);
+        if (branch is "HEAD" or "" or "（未知）")
+            return new GitResult { ExitCode = -1, Error = "当前处于分离 HEAD 或无法识别分支，无法拉取。请先切换到具体分支。" };
+
+        var args = new List<string> { "pull", "--ff" };
+        if (string.IsNullOrWhiteSpace(Upstream(repo, branch)))
+        {
+            args.Add("origin");
+            args.Add(branch);
+        }
+        return Run(repo, args.ToArray());
+    }
+
+    /// <summary>远程分支列表（形如 origin/main、origin/feature/x，排除 origin/HEAD）；无远程或出错返回空列表</summary>
+    public static List<string> RemoteBranches(string repo, string remote = "origin")
+    {
+        var r = Run(repo, "branch", "-r", "--format=%(refname:short)");
+        if (!r.Ok) return new List<string>();
+        return r.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => s.Trim())
+            .Where(s => s.Length > 0
+                        && s.StartsWith(remote + "/", StringComparison.Ordinal)
+                        && !s.EndsWith("/HEAD", StringComparison.Ordinal))
+            .ToList();
+    }
+
+    /// <summary>
+    /// 获取远程分支并在本地创建/切换到同名跟踪分支（便于在其它终端继续作业）。
+    /// 本地已存在该分支名 → 直接 checkout；否则 git checkout -b &lt;local&gt; &lt;remoteBranch&gt; 建立跟踪。
+    /// </summary>
+    public static GitResult FetchAndCheckout(string repo, string remoteBranch)
+    {
+        var slash = remoteBranch.IndexOf('/');
+        if (slash < 0 || slash == remoteBranch.Length - 1)
+            return new GitResult { ExitCode = -1, Error = "远程分支名格式应为 origin/分支名。" };
+
+        var local = remoteBranch[(slash + 1)..].Trim();
+        if (local.Length == 0)
+            return new GitResult { ExitCode = -1, Error = "远程分支名格式错误（缺少本地分支名）。" };
+
+        var locals = Branches(repo);
+        return locals.Contains(local)
+            ? Run(repo, "checkout", local)
+            : Run(repo, "checkout", "-b", local, remoteBranch);
+    }
+
     // ================= 变更比对（DiffView 的数据来源） =================
 
     /// <summary>仓库是否已有提交（没有提交时 HEAD 无法解析，工作区比对要单独处理）</summary>
