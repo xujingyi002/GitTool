@@ -30,9 +30,15 @@ public class MainForm : Form
     private Button _btnTag = null!;
     private Button _btnPull = null!;
     private Button _btnFetchBranch = null!;
+    private Button _btnRetry = null!;
     private Button _btnDiff = null!;
 
     private List<GitCommit> _commits = new();
+
+    /// <summary>最近一次推送失败的提交号（用于「远程提交状态」列高亮 + 手动重试定位）；切分支后失效</summary>
+    private string _failedPushHash = "";
+    /// <summary>失败发生时的分支（与当前分支不一致时，旧失败标记失效）</summary>
+    private string _failedPushBranch = "";
 
     /// <summary>最近打开的仓库（最近使用的在最前），与下拉框内容一致</summary>
     private List<string> _history = new();
@@ -125,7 +131,7 @@ public class MainForm : Form
         var actions = new FlowLayoutPanel
         {
             Dock = DockStyle.Bottom,
-            Height = 116,
+            Height = 140,
             WrapContents = true,
             Padding = new Padding(8, 6, 8, 4),
             BackColor = Color.WhiteSmoke
@@ -140,6 +146,7 @@ public class MainForm : Form
         _btnTag = MakeButton("打标签", BtnTag);
         _btnPull = MakeButton("拉取当前分支", BtnPull, Color.FromArgb(39, 174, 96));
         _btnFetchBranch = MakeButton("获取远程分支", BtnFetchBranch, Color.FromArgb(41, 128, 185));
+        _btnRetry = MakeButton("重试推送（同步远程）", BtnRetryPush, Color.FromArgb(192, 57, 43));
         _btnDiff = MakeButton("查看提交的改动", BtnViewCommitDiff, Color.FromArgb(41, 128, 185));
         actions.Controls.Add(_btnCommit);
         actions.Controls.Add(_btnRevert);
@@ -148,6 +155,7 @@ public class MainForm : Form
         actions.Controls.Add(_btnDiscard);
         actions.Controls.Add(_btnPull);
         actions.Controls.Add(_btnFetchBranch);
+        actions.Controls.Add(_btnRetry);
         actions.Controls.Add(_btnNewBranch);
         actions.Controls.Add(_btnCheckout);
         actions.Controls.Add(_btnTag);
@@ -268,17 +276,86 @@ public class MainForm : Form
     private void SetupGrid()
     {
         _grid.Columns.Clear();
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "ShortHash", HeaderText = "提交号", DataPropertyName = "ShortHash", FillWeight = 10 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Date", HeaderText = "时间", DataPropertyName = "Date", FillWeight = 18 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Author", HeaderText = "作者", DataPropertyName = "Author", FillWeight = 12 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Subject", HeaderText = "说明", DataPropertyName = "Subject", FillWeight = 60 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "ShortHash", HeaderText = "提交号", DataPropertyName = "ShortHash", FillWeight = 9 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Date", HeaderText = "时间", DataPropertyName = "Date", FillWeight = 15 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Author", HeaderText = "作者", DataPropertyName = "Author", FillWeight = 10 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Subject", HeaderText = "说明", DataPropertyName = "Subject", FillWeight = 50 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "RemoteStatus", HeaderText = "远程提交状态", DataPropertyName = "RemoteStatusText", FillWeight = 16 });
         _grid.SelectionChanged -= Grid_SelectionChanged;
         _grid.SelectionChanged += Grid_SelectionChanged;
         _grid.CellDoubleClick -= Grid_CellDoubleClick;
         _grid.CellDoubleClick += Grid_CellDoubleClick;
+        _grid.CellFormatting -= Grid_CellFormatting;
+        _grid.CellFormatting += Grid_CellFormatting;
+    }
+
+    /// <summary>
+    /// 按远程状态给「远程提交状态」列上色：已同步=绿、未推送=橙、无远程=灰、推送失败=红（加粗）。
+    /// 让用户一眼区分哪些提交已同步、哪些待推送 / 推送失败。
+    /// </summary>
+    private void Grid_CellFormatting(object? sender, DataGridViewCellFormattingEventArgs e)
+    {
+        if (e.ColumnIndex < 0 || e.RowIndex < 0) return;
+        if (_grid.Columns[e.ColumnIndex]?.Name != "RemoteStatus") return;
+        var c = _grid.Rows[e.RowIndex].DataBoundItem as GitCommit;
+        if (c is null) return;
+        e.CellStyle.ForeColor = c.RemoteStatus switch
+        {
+            RemoteCommitStatus.Synced => Color.FromArgb(39, 174, 96),
+            RemoteCommitStatus.NotPushed => Color.FromArgb(230, 126, 34),
+            RemoteCommitStatus.NoRemote => Color.FromArgb(130, 130, 130),
+            RemoteCommitStatus.PushFailed => Color.FromArgb(192, 0, 0),
+            _ => Color.FromArgb(90, 90, 90)
+        };
+        e.CellStyle.Font = new Font(_grid.Font, c.RemoteStatus == RemoteCommitStatus.PushFailed ? FontStyle.Bold : FontStyle.Regular);
     }
 
     // ================= 数据加载 =================
+
+    /// <summary>
+    /// 计算每个本地提交的「远程提交状态」，并写入状态栏同步概览。
+    /// 真相来源：把当前分支与远程跟踪引用（origin/&lt;branch&gt;）做可达性比对——
+    /// 远程已有的提交=「已同步」，本地独有（未推送/推送失败）=「未推送」；无 origin=「无远程」。
+    /// 最近一次推送失败的提交额外高亮为「推送失败（需重试）」，便于用户点「重试推送」处理。
+    /// </summary>
+    private void ApplyRemoteStatus()
+    {
+        var branch = GitService.CurrentBranch(_repo);
+
+        // 切换分支/仓库后，旧的失败标记失效（避免误标其它分支的提交）
+        if (!string.Equals(_failedPushBranch, branch, StringComparison.OrdinalIgnoreCase))
+            _failedPushHash = "";
+
+        var (hasRemote, synced) = GitService.RemoteSyncMap(_repo, branch);
+        var pending = 0;
+        foreach (var c in _commits)
+        {
+            RemoteCommitStatus st = !hasRemote
+                ? RemoteCommitStatus.NoRemote
+                : synced.Contains(c.Hash) ? RemoteCommitStatus.Synced
+                : RemoteCommitStatus.NotPushed;
+            if (st == RemoteCommitStatus.NotPushed
+                && !string.IsNullOrEmpty(_failedPushHash)
+                && string.Equals(c.Hash, _failedPushHash, StringComparison.OrdinalIgnoreCase))
+            {
+                st = RemoteCommitStatus.PushFailed;
+            }
+            c.RemoteStatus = st;
+            c.RemoteStatusText = st switch
+            {
+                RemoteCommitStatus.Synced => "已同步",
+                RemoteCommitStatus.NotPushed => "未推送",
+                RemoteCommitStatus.NoRemote => "无远程",
+                RemoteCommitStatus.PushFailed => "推送失败（需重试）",
+                _ => "未知"
+            };
+            if (st is RemoteCommitStatus.NotPushed or RemoteCommitStatus.PushFailed) pending++;
+        }
+
+        var syncedCount = _commits.Count - pending;
+        _lblStatus.Text = $"仓库状态：{GitService.StatusSummary(_repo)}　｜　HEAD：{GitService.HeadHash(_repo)}　｜　" +
+                          $"远程：已同步 {syncedCount} / 未推送 {pending}{(hasRemote ? "" : "（无 origin）")}";
+    }
 
     /// <summary>刷新仓库状态、分支与提交历史（每次操作后都会调用）</summary>
     private void RefreshAll()
@@ -301,10 +378,10 @@ public class MainForm : Form
         var name = Path.GetFileName(_repo.TrimEnd(Path.DirectorySeparatorChar));
         Text = string.IsNullOrEmpty(name) ? $"{_repo} — Git 仓库管理工具" : $"[{name}] Git 仓库管理工具";
         _lblBranch.Text = $"分支：{GitService.CurrentBranch(_repo)}";
-        _lblStatus.Text = $"仓库状态：{GitService.StatusSummary(_repo)}　｜　HEAD：{GitService.HeadHash(_repo)}";
         _lblStatus.ForeColor = GitService.Status(_repo).Length == 0 ? Color.FromArgb(39, 174, 96) : Color.FromArgb(230, 126, 34);
 
         _commits = GitService.Log(_repo);
+        ApplyRemoteStatus();   // 计算「远程提交状态」列 + 状态栏同步概览
         _grid.DataSource = null;
         _grid.DataSource = _commits;
         if (_grid.Rows.Count > 0)
@@ -456,6 +533,7 @@ public class MainForm : Form
         var status = GitService.Status(_repo);
         if (string.IsNullOrWhiteSpace(status))
         {
+            AppendLog("ⓘ 工作区没有需要提交的改动。");
             Warn("工作区没有需要提交的改动。");
             return;
         }
@@ -499,23 +577,51 @@ public class MainForm : Form
 
         var upstream = GitService.Upstream(_repo, branch);
         var setUp = string.IsNullOrWhiteSpace(upstream);
-        AppendLog($"──── {(auto ? "自动" : "")}推送到远程：{branch}{(setUp ? "（首次，自动设置 upstream）" : "")}────");
-        var push = GitService.Push(_repo, setUp);
+        AppendLog($"──── {(auto ? "自动" : "手动")}推送到远程：{branch}{(setUp ? "（首次，自动设置 upstream）" : "")}────");
+
+        // 带自动重试：瞬时错误（网络抖动 / 超时）会自动重发，最多 3 次；分叉被拒不盲目重试
+        var push = GitService.PushWithRetry(_repo, setUp, maxRetries: 3, retryDelayMs: 1500);
         AppendLog(push.Ok ? $"✔ 已推送到远程：{branch}" : $"✖ 推送失败（退出码 {push.ExitCode}）");
         if (!string.IsNullOrWhiteSpace(push.Text)) AppendLog(push.Text);
 
-        if (!push.Ok)
+        if (push.Ok)
         {
-            // 本地提交已成功保留，不回滚；提示用户先拉取解决分叉
-            AppendLog("⚠ 本地提交已保留，但推送被拒绝。最常见原因是远程已有新提交（与本地分叉），请先「拉取当前分支」合并后再试。");
-            MessageBox.Show(push.Text + "\n\n常见原因：远程已有新提交（与本地分叉）。\n请先点「拉取当前分支」合并，再提交/推送。本地提交不会丢失。",
-                "推送失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            _failedPushHash = "";   // 推送成功 → 清除失败标记
+            _failedPushBranch = "";
+            AppendLog("✔ 本地与远程已同步（本地提交 = 远程提交）。");
         }
         else
         {
-            AppendLog("✔ 本地与远程已同步（本地提交 = 远程提交）。");
+            // 记录最新提交，便于「远程提交状态」列高亮 + 手动「重试推送」定位；本地提交保留不回滚
+            _failedPushHash = GitService.HeadHash(_repo);
+            _failedPushBranch = branch;
+            var transient = GitService.IsTransientFailure(push.Text);
+            AppendLog(transient
+                ? "⚠ 本地提交已保留，但推送因网络 / 超时失败（已自动重试仍失败）。可稍后点「重试推送」再试。"
+                : "⚠ 本地提交已保留，但推送被拒绝。最常见原因是远程已有新提交（与本地分叉），请先「拉取当前分支」合并后再试。");
+            MessageBox.Show(push.Text + "\n\n" + (transient
+                    ? "推送因网络 / 超时失败（已自动重试仍失败）。\n可稍后点击「重试推送」再次尝试。本地提交不会丢失。"
+                    : "常见原因：远程已有新提交（与本地分叉）。\n请先点「拉取当前分支」合并，再点「重试推送」。本地提交不会丢失。"),
+                "推送失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         RefreshAll();
+    }
+
+    /// <summary>
+    /// 手动重试入口：重新把当前分支推送到远程（覆盖「自动重试后仍失败」的提交）。
+    /// 既处理网络瞬时失败，也便于用户在「拉取」解决分叉后手动同步。
+    /// </summary>
+    private void BtnRetryPush(object? sender, EventArgs e)
+    {
+        if (!EnsureRepo()) return;
+        if (!GitService.HasRemote(_repo))
+        {
+            AppendLog("ⓘ 当前仓库没有配置远程仓库（origin），无法推送。");
+            Warn("当前仓库没有配置远程仓库（origin），无法推送。\n如需同步，请先用命令行添加远程：git remote add origin <仓库URL>。");
+            return;
+        }
+        // 复用 AutoPush（auto=false 表示手动触发，日志不带「自动」前缀）
+        AutoPush(auto: false);
     }
 
     /// <summary>撤销某次提交：生成反向提交（不改写历史，最安全）</summary>
@@ -603,7 +709,12 @@ public class MainForm : Form
     private void BtnPull(object? sender, EventArgs e)
     {
         if (!EnsureRepo()) return;
-        if (!GitService.HasRemote(_repo)) { Warn("当前仓库没有配置远程仓库（origin），无法拉取。"); return; }
+        if (!GitService.HasRemote(_repo))
+        {
+            AppendLog("ⓘ 当前仓库没有配置远程仓库（origin），无法拉取。");
+            Warn("当前仓库没有配置远程仓库（origin），无法拉取。");
+            return;
+        }
 
         // 先获取远程全部更新，再拉取当前分支（确保拿到最新）
         RunGit("获取远程更新（fetch）", () => GitService.Fetch(_repo, "origin"), refresh: false);
@@ -614,7 +725,12 @@ public class MainForm : Form
     private void BtnFetchBranch(object? sender, EventArgs e)
     {
         if (!EnsureRepo()) return;
-        if (!GitService.HasRemote(_repo)) { Warn("当前仓库没有配置远程仓库（origin），无法获取远程分支。"); return; }
+        if (!GitService.HasRemote(_repo))
+        {
+            AppendLog("ⓘ 当前仓库没有配置远程仓库（origin），无法获取远程分支。");
+            Warn("当前仓库没有配置远程仓库（origin），无法获取远程分支。");
+            return;
+        }
 
         // 先 fetch，确保拿到最新远程分支信息
         RunGit("获取远程更新（fetch）", () => GitService.Fetch(_repo, "origin"), refresh: false);

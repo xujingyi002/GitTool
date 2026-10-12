@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Threading;
 
 namespace GitTool;
 
@@ -25,6 +26,12 @@ public class GitCommit
 
     /// <summary>兜底：即使绑定丢掉 DisplayMember，下拉框也显示提交内容而不是类名</summary>
     public override string ToString() => Display;
+
+    /// <summary>远程同步状态（「远程提交状态」列的数据源；每次刷新时由 MainForm 计算填入）</summary>
+    public RemoteCommitStatus RemoteStatus { get; set; } = RemoteCommitStatus.Unknown;
+
+    /// <summary>远程状态的中文展示文本（「远程提交状态」列直接绑定）</summary>
+    public string RemoteStatusText { get; set; } = "";
 }
 
 /// <summary>git 命令执行结果</summary>
@@ -234,6 +241,71 @@ public static class GitService
         args.Add("origin");
         args.Add(branch);
         return Run(repo, args.ToArray());
+    }
+
+    /// <summary>
+    /// 带自动重试的推送：首次失败且属于「瞬时错误」（网络抖动 / 超时 / 连接中断）时，
+    /// 按退避间隔自动重发最多 maxRetries 次。
+    /// 非瞬时错误（如远程分叉被拒）不盲目重试，直接返回失败，交由用户先「拉取」再手动重试。
+    /// setUpstream 在每次尝试都带上（首次推送建跟踪，幂等）。
+    /// </summary>
+    public static GitResult PushWithRetry(string repo, bool setUpstream, int maxRetries = 3, int retryDelayMs = 1500)
+    {
+        GitResult last = new();
+        for (var attempt = 1; attempt <= Math.Max(1, maxRetries); attempt++)
+        {
+            last = Push(repo, setUpstream);
+            if (last.Ok) return last;
+            if (attempt >= maxRetries || !IsTransientFailure(last.Text)) break;
+            Thread.Sleep(retryDelayMs);
+        }
+        return last;
+    }
+
+    /// <summary>判断推送失败是否为「瞬时错误」（网络 / 超时 / 连接类），这类才值得自动重试</summary>
+    public static bool IsTransientFailure(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        return text.Contains("Could not resolve host")
+            || text.Contains("timed out") || text.Contains("Connection timed out")
+            || text.Contains("Connection refused") || text.Contains("Connection reset")
+            || text.Contains("unable to access") || text.Contains("Failed to connect")
+            || text.Contains("early EOF") || text.Contains("The remote end hung up")
+            || text.Contains("Connection unexpectedly closed") || text.Contains("Temporary failure")
+            || text.Contains("network is unreachable")
+            || (text.Contains("SSL") && text.Contains("handshake"));
+    }
+
+    /// <summary>返回远程跟踪引用名（优先 upstream，其次 origin/&lt;branch&gt;）；不存在返回 ""</summary>
+    public static string UpstreamRef(string repo, string branch)
+    {
+        var up = Upstream(repo, branch);
+        if (!string.IsNullOrWhiteSpace(up)) return up;
+        var r = Run(repo, "rev-parse", "--verify", $"origin/{branch}");
+        return r.Ok ? $"origin/{branch}" : "";
+    }
+
+    /// <summary>
+    /// 计算每个本地提交在远程的状态：返回（是否配置了 origin，远程已包含提交哈希集合）。
+    /// 用一次 git rev-list &lt;upstream&gt; 拉全量远程提交哈希，再逐提交判断是否在其中，
+    /// 这是「远程提交状态」列实时查询的真相来源。
+    /// </summary>
+    public static (bool hasRemote, HashSet<string> synced) RemoteSyncMap(string repo, string branch)
+    {
+        var hasRemote = HasRemote(repo);
+        var synced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (hasRemote)
+        {
+            var upstream = UpstreamRef(repo, branch);
+            if (!string.IsNullOrWhiteSpace(upstream))
+            {
+                var r = Run(repo, "rev-list", upstream);
+                if (r.Ok)
+                    foreach (var h in r.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                        synced.Add(h.Trim());
+            }
+        }
+        return (hasRemote, synced);
     }
 
     /// <summary>从远程获取更新（默认 origin；含所有分支与标签）</summary>
@@ -620,4 +692,23 @@ public class FileChange
 
     /// <summary>完整展示文本（可复制）</summary>
     public string Display => $"[{KindText}] {FilePath}  {StatText}";
+}
+
+/// <summary>远程提交状态：用于「提交明细列表」的「远程提交状态」列，实时反映本地提交是否已同步到远程</summary>
+public enum RemoteCommitStatus
+{
+    /// <summary>尚未确定（如分离 HEAD、无法识别分支）</summary>
+    Unknown,
+
+    /// <summary>已同步到远程（远程已有该提交）</summary>
+    Synced,
+
+    /// <summary>未推送（本地有，但远程还没有；可能因从未推送或推送失败）</summary>
+    NotPushed,
+
+    /// <summary>无远程仓库（origin 未配置，无法同步）</summary>
+    NoRemote,
+
+    /// <summary>已尝试推送但被远程拒绝（如分叉 / 网络），需手动重试</summary>
+    PushFailed
 }
