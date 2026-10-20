@@ -539,9 +539,10 @@ public class MainForm : Form
         }
 
         var n = status.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
-        var msg = Interaction.InputBox(
-            "请输入提交说明（第一行写概要）：" + Environment.NewLine + Environment.NewLine + status,
-            "提交当前改动（将自动推送到远程）", "说明本次改动");
+        // 独立对话框：改动列表可滚动、备注栏固定可见（不再用 InputBox，避免改动多时输入框被挤出屏幕）
+        using var dlg = new CommitDialog(Path.GetFileName(_repo.TrimEnd('\\', '/')), GitService.CurrentBranch(_repo), status);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        var msg = dlg.Message;
         if (string.IsNullOrWhiteSpace(msg)) return;
 
         // 1) 本地提交（先不刷新，等推送完成后统一刷新）
